@@ -8,6 +8,11 @@ import quant_cuda
 import torch.distributed as dist
 from quant_affine import *
 
+# Additional utilities for simulated annealing quantization
+import math
+from dataclasses import dataclass
+from typing import Tuple
+
 class QuantBase():
     def _quantization(x, quant_grid):
         shape = x.shape
@@ -644,3 +649,123 @@ class LinearQuantizer(nn.Module):
         input = self.quant_input(input, self.weight)
         # print(input.unique().numel(), self.quant_input.name)
         return F.linear(input, weight, self.bias)
+
+
+# ---------------------------------------------------------------------------
+# Simulated annealing based weight quantization
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SAQuantizationResult:
+    """Stores the result of simulated annealing quantization."""
+
+    levels: torch.Tensor  # Quantization levels (basis)
+    codes: torch.Tensor  # 6-bit codes for the clipped weights
+    outlier_mask: torch.Tensor  # Boolean mask of outliers
+    outlier_values: torch.Tensor  # 12-bit encoded outlier values
+    mse: float  # Final MSE between quantized and original weights
+
+
+def _quantize_with_levels(
+    w: torch.Tensor, levels: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize ``w`` to the nearest ``levels`` and return codes and MSE."""
+
+    w_flat = w.view(-1, 1)
+    levels_sorted, _ = torch.sort(levels)
+    dist = torch.abs(w_flat - levels_sorted.t())
+    codes = torch.argmin(dist, dim=1)
+    q_w = levels_sorted[codes].view_as(w)
+    mse = torch.mean((q_w - w) ** 2)
+    return q_w, codes.view_as(w), mse
+
+
+def _detect_outliers(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Detect outliers using ``|x| > mean + 3 * std`` and zero them."""
+
+    mean = w.mean()
+    std = w.std()
+    threshold = mean.abs() + 3 * std
+    mask = torch.abs(w) > threshold
+    w = w.clone()
+    w[mask] = 0.0
+    return w, mask
+
+
+def annealing_quantize(
+    w: torch.Tensor,
+    bit: int = 6,
+    n_iter: int = 2000,
+    init_temp: float = 1.0,
+    clip_ratio: float = 2.5,
+) -> SAQuantizationResult:
+    """Quantize ``w`` using simulated annealing and 12-bit outlier codes."""
+
+    device = w.device
+    w_clip, outlier_mask = _detect_outliers(w)
+    std = w_clip.std()
+    clip_val = clip_ratio * std
+    w_clip = torch.clamp(w_clip, -clip_val, clip_val)
+
+    n_levels = 2 ** bit
+    levels = torch.linspace(-clip_val, clip_val, n_levels, device=device)
+    q_w, _, best_mse = _quantize_with_levels(w_clip, levels)
+    best_levels = levels.clone()
+
+    temp = init_temp
+    anneal_rate = 0.99
+    for _ in range(n_iter):
+        perturb = torch.randn_like(levels) * temp * clip_val
+        proposal = torch.clamp(levels + perturb, -clip_val, clip_val)
+        proposal = torch.sort(proposal).values
+        q_w_prop, _, mse_prop = _quantize_with_levels(w_clip, proposal)
+        if mse_prop < best_mse or torch.rand(1).item() < math.exp((best_mse - mse_prop) / temp):
+            levels = proposal
+            q_w = q_w_prop
+            best_mse = mse_prop
+            best_levels = proposal
+        temp *= anneal_rate
+
+    q_w, codes, mse = _quantize_with_levels(w_clip, best_levels)
+
+    outlier_values = torch.zeros_like(w)
+    if outlier_mask.any():
+        scale = (2 ** 12 - 1) / clip_val
+        outlier_values[outlier_mask] = torch.clamp(w[outlier_mask], -clip_val, clip_val) * scale
+
+    return SAQuantizationResult(
+        levels=best_levels,
+        codes=codes,
+        outlier_mask=outlier_mask,
+        outlier_values=outlier_values.to(torch.int32),
+        mse=float(mse.item()),
+    )
+
+
+def dequantize(result: SAQuantizationResult) -> torch.Tensor:
+    """Reconstruct the tensor from :class:`SAQuantizationResult`."""
+
+    values = result.levels[result.codes]
+    if result.outlier_mask.any():
+        clip_val = result.levels.max().abs()
+        scale = (2 ** 12 - 1) / clip_val
+        recovered = result.outlier_values.to(values.dtype) / scale
+        values[result.outlier_mask] = recovered[result.outlier_mask]
+    return values
+
+
+def evaluate_perplexity(model: torch.nn.Module, data_loader) -> float:
+    """Evaluate perplexity of a language model for comparison."""
+
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    with torch.no_grad():
+        for input_ids, labels in data_loader:
+            logits = model(input_ids)[0]
+            loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+            total_loss += loss.item() * labels.numel()
+            total_tokens += labels.numel()
+    return math.exp(total_loss / total_tokens)
