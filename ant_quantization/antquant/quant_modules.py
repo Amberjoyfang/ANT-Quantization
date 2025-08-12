@@ -61,6 +61,8 @@ class Quantizer(nn.Module):
 
         ## debug
         self.name = None
+        # Cache for simulated annealing quantized weights
+        self.sa_qweight = None
 
     def disable_input_quantization(self):
         self.is_enable_activation = False
@@ -566,6 +568,11 @@ class Quantizer(nn.Module):
         else:
             if not self.is_enable_weight:
                 return tensor
+            if self.sa_qweight is None:
+                with torch.no_grad():
+                    result = annealing_quantize(tensor, bit=self.bit.item())
+                    self.sa_qweight = dequantize(result)
+            return self.sa_qweight
 
         with torch.no_grad():
             self._init_quant_para(tensor, input_tensor)
@@ -575,7 +582,7 @@ class Quantizer(nn.Module):
         else:
             q_tensor = self._forward(tensor)
 
-        return q_tensor    
+        return q_tensor
 
 class TensorQuantizer(Quantizer):
     def __init__(self, **kwargs):
