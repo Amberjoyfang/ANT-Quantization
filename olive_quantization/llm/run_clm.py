@@ -31,7 +31,7 @@ from itertools import chain
 from typing import Optional
 import torch
 import datasets
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 
 import evaluate
 import transformers
@@ -420,7 +420,11 @@ def main():
                 **dataset_args,
             )
 
-    if not (training_args.do_train or data_args.eval_subset == 'train'):
+    if (
+        isinstance(raw_datasets, DatasetDict)
+        and "train" in raw_datasets
+        and not (training_args.do_train or data_args.eval_subset == "train")
+    ):
         # If not training and not evaluating on train, we do not need to process it
         del raw_datasets["train"]
         
